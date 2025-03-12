@@ -963,7 +963,7 @@ Y_UNIT_TEST_SUITE(TMiniKQLWideCombinerPerfTest) {
     }
 
     Y_UNIT_TEST_LLVM(TestTpch) {
-        TSetup<LLVM> setup;
+        TSetup<LLVM, true> setup;
 
         struct TPairHash { size_t operator()(const std::pair<std::string_view, std::string_view>& p) const { return CombineHashes(std::hash<std::string_view>()(p.first), std::hash<std::string_view>()(p.second)); } };
 
@@ -1882,7 +1882,7 @@ Y_UNIT_TEST_SUITE(TMiniKQLWideLastCombinerPerfTest) {
     }
 
     Y_UNIT_TEST_LLVM(TestTpch) {
-        TSetup<LLVM> setup;
+        TSetup<LLVM, true> setup;
 
         struct TPairHash { size_t operator()(const std::pair<std::string_view, std::string_view>& p) const { return CombineHashes(std::hash<std::string_view>()(p.first), std::hash<std::string_view>()(p.second)); } };
 
@@ -1926,7 +1926,7 @@ Y_UNIT_TEST_SUITE(TMiniKQLWideLastCombinerPerfTest) {
         }));
         const auto list = TCallableBuilder(pb.GetTypeEnvironment(), "TestList", listType).Build();
 
-        const auto pgmReturn = pb.Collect(pb.NarrowMap(pb.WideLastCombiner(
+        const auto pgmReturn = pb.Collect(pb.NarrowMap(pb.WideLastCombinerWithSpilling(
             pb.WideFilter(pb.ExpandMap(pb.ToFlow(TRuntimeNode(list, false)),
                 [&](TRuntimeNode item) -> TRuntimeNode::TList { return {pb.Nth(item, 0U), pb.Nth(item, 1U), pb.Nth(item, 2U), pb.Nth(item, 3U), pb.Nth(item, 4U), pb.Nth(item, 5U), pb.Nth(item, 6U)}; }),
                 [&](TRuntimeNode::TList items) { return pb.AggrLessOrEqual(items.front(), pb.NewDataLiteral<ui64>(border)); }
@@ -1949,6 +1949,7 @@ Y_UNIT_TEST_SUITE(TMiniKQLWideLastCombinerPerfTest) {
         ));
 
         const auto graph = setup.BuildGraph(pgmReturn, {list});
+        graph->GetContext().SpillerFactory = std::make_shared<TMockSpillerFactory>();
         NUdf::TUnboxedValue* items = nullptr;
         graph->GetEntryPoint(0, true)->SetValue(graph->GetContext(), graph->GetHolderFactory().CreateDirectArrayHolder(TpchSamples.size(), items));
         for (const auto& sample : TpchSamples) {
