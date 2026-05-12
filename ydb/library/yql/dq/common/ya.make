@@ -15,6 +15,7 @@ SRCS(
     dq_serialized_batch.cpp
     rope_over_buffer.h
     rope_over_buffer.cpp
+    timing_trace.cpp
 )
 
 GENERATE_ENUM_SERIALIZATION(dq_common.h)

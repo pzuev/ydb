@@ -22,6 +22,8 @@ PEERDIR(
     yql/essentials/sql/pg
 
     yt/yql/providers/yt/gateway/file
+
+    ydb/library/yql/dq/common
 )
 
 PEERDIR(

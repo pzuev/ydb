@@ -19,6 +19,8 @@
 #include <yql/essentials/minikql/mkql_node_cast.h>
 #include <yql/essentials/minikql/defs.h>
 
+#include <ydb/library/yql/dq/common/timing_trace.h>
+
 #include <util/system/backtrace.h>
 
 #include <yql/essentials/utils/yql_panic.h>
@@ -701,6 +703,7 @@ protected:
 
         for (size_t i = 0; i < NumBuckets; ++i) {
             size_t bucketEntries = 0;
+            TTimingTrace::TTraceScope writeScope(TraceLane, TStringBuilder() << "InitiateSpilling write bucket" << i);
             TWideUnboxedValuesSpillerAdapter& spiller = *currentSpilling.Spillage[i].SpilledState;
             TSegmentedArena::TPageEntry* page = Store->PagesByTag[i];
             while (page != nullptr) {
@@ -717,8 +720,11 @@ protected:
                     if (!pageFuture.has_value()) {
                         continue;
                     }
-                    while (!pageFuture->HasValue()) {
-                        co_yield {};
+                    {
+                        TTimingTrace::TTraceScope writeScope(TraceLane, "InitiateSpilling yield");
+                        while (!pageFuture->HasValue()) {
+                            co_yield {};
+                        }
                     }
                     spiller.AsyncWriteCompleted(pageFuture->ExtractValue());
                     ++totalFlushed;
@@ -728,8 +734,11 @@ protected:
             auto finishFuture = spiller.FinishWriting();
             if (finishFuture.has_value()) {
                 ++totalFlushed;
-                while (!finishFuture->HasValue()) {
-                    co_yield {};
+                {
+                    TTimingTrace::TTraceScope writeScope(TraceLane, "InitiateSpilling yield");
+                    while (!finishFuture->HasValue()) {
+                        co_yield {};
+                    }
                 }
                 spiller.AsyncWriteCompleted(finishFuture->ExtractValue());
             }
@@ -755,6 +764,7 @@ protected:
 
         TTaskSpillage& currentSpill = SpillingStack.back();
         for (size_t i = 0; i < NumBuckets; ++i) {
+            TTimingTrace::TTraceScope writeScope(TraceLane, TStringBuilder() << "FlushSpillingInput write bucket" << i);
             TWideUnboxedValuesSpillerAdapter& spiller = *currentSpill.Spillage[i].SpilledInput;
             TSegmentedArena::TPageEntry* page = Store->PagesByTag[i];
             while (page != nullptr) {
@@ -771,8 +781,11 @@ protected:
                         continue;
                     }
                     ++totalFlushed;
-                    while (!pageFuture->HasValue()) {
-                        co_yield {};
+                    {
+                        TTimingTrace::TTraceScope flushScope(TraceLane, "FlushSpillingInput yield");
+                        while (!pageFuture->HasValue()) {
+                            co_yield {};
+                        }
                     }
                     spiller.AsyncWriteCompleted(pageFuture->ExtractValue());
                 }
@@ -780,6 +793,7 @@ protected:
             }
             auto finishFuture = spiller.FinishWriting();
             if (finishFuture.has_value()) {
+                TTimingTrace::TTraceScope flushScope(TraceLane, "FlushSpillingInput yield");
                 ++totalFlushed;
                 while (!finishFuture->HasValue()) {
                     co_yield {};
@@ -1199,6 +1213,8 @@ public:
     {
         TempKeyBuffer.resize(KeyTypes.size(), {});
 
+        TraceLane = TStringBuilder() << "DqHashAggregate-" << (size_t)(this);
+
         if (!IsAggregation) {
             IsEstimating = !(MemoryHelper.KeySizeBound && MemoryHelper.StateSizeBound);
             if (IsEstimating) {
@@ -1537,6 +1553,8 @@ protected:
 
     const bool CanBypass;
     const TDqHashCombineTestParams TestParams;
+
+    TString TraceLane;
 };
 
 class TWideAggregationState: public TBaseAggregationState

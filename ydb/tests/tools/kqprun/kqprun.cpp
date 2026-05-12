@@ -13,6 +13,7 @@
 #include <ydb/library/testlib/common/test_utils.h>
 #include <ydb/library/yaml_config/yaml_config.h>
 #include <ydb/library/yql/providers/pq/gateway/dummy/yql_pq_dummy_gateway.h>
+#include <ydb/library/yql/dq/common/timing_trace.h>
 #include <ydb/tests/tools/kqprun/runlib/application.h>
 #include <ydb/tests/tools/kqprun/runlib/utils.h>
 #include <ydb/tests/tools/kqprun/src/kqp_runner.h>
@@ -1153,6 +1154,7 @@ int main(int argc, const char* argv[]) {
     NKqpRun::TMain main;
 
     try {
+        TTimingTrace::GetRecorder().Start();
         main.Run(argc, argv);
     } catch (...) {
         NColorizer::TColors colors = NColorizer::AutoColors(Cerr);
@@ -1160,6 +1162,8 @@ int main(int argc, const char* argv[]) {
         Cerr << colors.Red() <<  CurrentExceptionMessage() << colors.Default() << Endl;
         return 1;
     }
+
+    TTimingTrace::GetRecorder().Stop();
 
     return 0;
 }
