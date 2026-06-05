@@ -567,7 +567,7 @@ constexpr const size_t UpperFixedRowCount = 128 * 1024ULL; // maximum hash table
 constexpr const size_t BucketBits = 7;
 constexpr const size_t NumBuckets = 1ULL << BucketBits;
 constexpr const size_t SpillingIoBuffer = 5_MB;
-constexpr const size_t StorageArenaMinSize = 32_MB;
+constexpr const size_t StorageArenaMinSize = 600_MB;
 
 struct TDqHashCombineTestParams
 {

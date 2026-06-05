@@ -1,6 +1,8 @@
 #pragma once
 #include "mkql_spiller.h"
 #include <yql/essentials/minikql/computation/mkql_computation_node_pack.h>
+#include <contrib/libs/lz4/lz4.h>
+#include <util/stream/buffer.h>
 
 #include <utility>
 
@@ -67,9 +69,38 @@ public:
     }
 
     void AsyncReadCompleted(NYql::TChunkedBuffer&& rope, const THolderFactory& holderFactory) {
-        // Implementation detail: deserialization is performed in a processing thread
         TUnboxedValueBatch batch(ItemType_);
-        Packer_.UnpackBatch(std::move(rope), holderFactory, batch);
+        size_t linearSize = rope.Size();
+        TBufferOutput rawCompressed(linearSize);
+        rope.CopyTo(rawCompressed, linearSize);
+
+        if (linearSize < 4) {
+            ythrow yexception() << "lz4 chunk missing" << Endl;
+        }
+
+        int uncompressedSize = ReadUnaligned<int>(rawCompressed.Buffer().Data());
+        if (uncompressedSize < 4) {
+            ythrow yexception() << "lz4 chunk corrupted" << Endl;
+        }
+
+        TString decomp;
+        decomp.resize(uncompressedSize, 0);
+
+        int decompResult = LZ4_decompress_safe(rawCompressed.Buffer().Data() + sizeof(int), decomp.begin(), linearSize - 4, uncompressedSize);
+        if (decompResult < uncompressedSize) {
+            ythrow yexception() << "lz4 decompression failed: " << linearSize << " -> " << uncompressedSize;
+        }
+
+        ui32 magic = ReadUnaligned<ui32>(decomp.begin() + decomp.size() - 4);
+        if (magic != 0xC0DED00D) {
+            ythrow yexception() << "lz4: magic failed" << Endl;
+        }
+        decomp.resize(decomp.size() - 4, 0);
+
+        NYql::TChunkedBuffer destRope;
+        destRope.Append(std::move(decomp));
+
+        Packer_.UnpackBatch(std::move(destRope), holderFactory, batch);
         CurrentBatch_ = std::move(batch);
     }
 
@@ -99,7 +130,34 @@ private:
         ui64 estimatedPackedSize = Packer_.PackedSizeEstimate();
         ReportPackerSize(estimatedPackedSize, forced);
         if (estimatedPackedSize > SizeLimit_ || forced) {
-            return Spiller_->Put(std::move(Packer_.Finish()));
+            auto chunkedBuffer = Packer_.Finish();
+            size_t sourceDataSize = chunkedBuffer.Size();
+
+            TBufferOutput linearUncompressed(sourceDataSize + 4);
+            chunkedBuffer.CopyTo(linearUncompressed);
+            linearUncompressed.Buffer().Advance(4);
+            WriteUnaligned<ui32>(linearUncompressed.Buffer().Begin() + sourceDataSize, 0xC0DED00D);
+
+            if (linearUncompressed.Buffer().Size() > std::numeric_limits<int>::max() - 32) {
+                ythrow yexception() << "chunk to compress is too large" << Endl;
+            }
+            int srcSize = static_cast<int>(linearUncompressed.Buffer().Size());
+
+            int destSizeEst = LZ4_compressBound(srcSize);
+
+            TString outComp;
+            outComp.resize(destSizeEst + 4, 0);
+            int compressedBytes = LZ4_compress_default(linearUncompressed.Buffer().Data(), outComp.begin() + 4, srcSize, destSizeEst);
+            if (!compressedBytes) {
+                ythrow yexception() << "compression failed" << Endl;
+            }
+            WriteUnaligned<int>(outComp.begin(), srcSize);
+            outComp.resize(compressedBytes + 4, 0);
+
+            NYql::TChunkedBuffer toSpill;
+            toSpill.Append(std::move(outComp));
+
+            return Spiller_->Put(std::move(toSpill));
         }
 
         return std::nullopt;
@@ -108,7 +166,7 @@ private:
     ISpiller::TPtr Spiller_;
     const TMultiType* const ItemType_;
     const size_t SizeLimit_;
-    TValuePackerTransport<false> Packer_;
+    TValuePackerTransport<true> Packer_;
     std::deque<ISpiller::TKey> StoredChunks_;
     std::optional<TUnboxedValueBatch> CurrentBatch_;
     ui64 ReportedPackerSize_ = 0;
