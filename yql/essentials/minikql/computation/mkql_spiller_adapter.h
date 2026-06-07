@@ -166,7 +166,7 @@ private:
     ISpiller::TPtr Spiller_;
     const TMultiType* const ItemType_;
     const size_t SizeLimit_;
-    TValuePackerTransport<true> Packer_;
+    TValuePackerTransport<false> Packer_;
     std::deque<ISpiller::TKey> StoredChunks_;
     std::optional<TUnboxedValueBatch> CurrentBatch_;
     ui64 ReportedPackerSize_ = 0;
