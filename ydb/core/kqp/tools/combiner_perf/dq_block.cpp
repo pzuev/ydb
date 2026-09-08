@@ -1314,9 +1314,14 @@ void RunTestDqBlock(TRunParams params, TTestResultCollector& printout)
     //std::optional<TRunResult> finalResult;
     for (int attempt = 1; attempt <= params.NumAttempts; ++attempt) {
         Cerr << "------ DQ block run " << attempt << " of " << params.NumAttempts << Endl;
-        auto result = RunForked([&] {
-            return MeasureGraph<LLVM, Spilling>(*graph, outputWidth);
-        });
+        TRunResult result;
+        if (params.NumAttempts > 1 && !params.EnableVerification) {
+            result = RunForked([&] {
+                return MeasureGraph<LLVM, Spilling>(*graph, outputWidth);
+            });
+        } else {
+            result = MeasureGraph<LLVM, Spilling>(*graph, outputWidth);
+        }
         printout.SubmitMetrics(params, result, "DqHashAggregateBlock", LLVM, Spilling);
     }
 
