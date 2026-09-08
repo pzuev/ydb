@@ -1311,17 +1311,13 @@ void RunTestDqBlock(TRunParams params, TTestResultCollector& printout)
     auto blockStream = TUnboxedValuePod(new TPrebuiltBlockStream(blockValues, params.NumRuns));
     graph->GetEntryPoint(0, true)->SetValue(graph->GetContext(), std::move(blockStream));
 
-    std::optional<TRunResult> finalResult;
+    //std::optional<TRunResult> finalResult;
     for (int attempt = 1; attempt <= params.NumAttempts; ++attempt) {
         Cerr << "------ DQ block run " << attempt << " of " << params.NumAttempts << Endl;
         auto result = RunForked([&] {
             return MeasureGraph<LLVM, Spilling>(*graph, outputWidth);
         });
-        if (finalResult) {
-            MergeRunResults(result, *finalResult);
-        } else {
-            finalResult = result;
-        }
+        printout.SubmitMetrics(params, result, "DqHashAggregateBlock", LLVM, Spilling);
     }
 
     if (params.EnableVerification) {
@@ -1333,7 +1329,7 @@ void RunTestDqBlock(TRunParams params, TTestResultCollector& printout)
         });
     }
 
-    printout.SubmitMetrics(params, *finalResult, "DqHashAggregateDqBlock", LLVM, Spilling);
+    //printout.SubmitMetrics(params, *finalResult, "DqHashAggregateDqBlock", LLVM, Spilling);
 }
 
 template void RunTestDqBlock<false, false>(TRunParams params, TTestResultCollector& printout);
