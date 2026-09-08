@@ -16,6 +16,9 @@
 
 #include <util/generic/size_literals.h>
 
+#include <map>
+#include <optional>
+
 namespace NKikimr {
 namespace NMiniKQL {
 
@@ -32,13 +35,6 @@ void ApplyTestPoint(THolder<IComputationGraph>& graph, Func func)
         return std::invoke(func, *testPoints);
     }
     UNIT_FAIL("Couldn't find a DqHashCombine node wrapper in the graph");
-}
-
-void DisableDehydration(THolder<IComputationGraph>& graph)
-{
-    ApplyTestPoint(graph, [](TDqHashCombineTestPoints& tp) {
-        tp.DisableStateDehydration(true);
-    });
 }
 
 void DisableKeyPassthrough(THolder<IComputationGraph>& graph)
@@ -532,6 +528,150 @@ THolder<IComputationGraph> BuildWideGraph(
     return setup.BuildGraph(rootNode, {streamCallable});
 }
 
+using TMixedKey = std::pair<ui32, std::optional<i64>>;
+using TMixedState = std::pair<ui64, std::string>;
+using TMixedReference = std::map<TMixedKey, TMixedState>;
+
+std::shared_ptr<ISpillerFactory> CreateSpillerFactory();
+
+class TMixedWideStream final : public NUdf::TBoxedValue {
+public:
+    TMixedWideStream(size_t rowCount, TMixedReference& reference, std::function<void(size_t)> callback = {})
+        : RowCount(rowCount)
+        , Reference(reference)
+        , Callback(std::move(callback))
+    {
+    }
+
+    NUdf::EFetchStatus Fetch(NUdf::TUnboxedValue&) final {
+        ythrow yexception() << "only WideFetch is supported here";
+    }
+
+    NUdf::EFetchStatus WideFetch(NUdf::TUnboxedValue* result, ui32 width) final {
+        UNIT_ASSERT_VALUES_EQUAL(width, 4);
+        if (Row == RowCount) {
+            return NUdf::EFetchStatus::Finish;
+        }
+
+        if (Callback) {
+            Callback(Row);
+        }
+        const ui32 key32 = Row % 7;
+        const std::optional<i64> key64 = Row % 5 ? std::optional<i64>(Row % 11) : std::nullopt;
+        const ui64 number = Row % 13 + 1;
+        const std::string string = Sprintf("long-state-value-%08zu", Row % 17);
+
+        result[0] = NUdf::TUnboxedValuePod(key32);
+        result[1] = key64 ? NUdf::TUnboxedValuePod(*key64) : NUdf::TUnboxedValuePod{};
+        result[2] = NUdf::TUnboxedValuePod(number);
+        result[3] = NUdf::TUnboxedValuePod(NUdf::TStringValue(string));
+
+        auto [it, inserted] = Reference.emplace(TMixedKey{key32, key64}, TMixedState{number, string});
+        if (!inserted) {
+            it->second.first += number;
+            it->second.second = std::max(it->second.second, string);
+        }
+        ++Row;
+        return NUdf::EFetchStatus::Ok;
+    }
+
+private:
+    const size_t RowCount;
+    TMixedReference& Reference;
+    std::function<void(size_t)> Callback;
+    size_t Row = 0;
+};
+
+template<bool LLVM, bool Spilling = false>
+THolder<IComputationGraph> BuildMixedWideGraph(
+    TDqSetup<LLVM, Spilling>& setup, bool useFlow, bool isAggregator, bool computedKeys)
+{
+    auto& pb = setup.GetDqProgramBuilder();
+    auto key32Type = pb.NewDataType(NUdf::TDataType<ui32>::Id);
+    auto key64Type = pb.NewOptionalType(pb.NewDataType(NUdf::TDataType<i64>::Id));
+    auto numberType = pb.NewDataType(NUdf::TDataType<ui64>::Id);
+    auto stringType = pb.NewDataType(NUdf::TDataType<char*>::Id);
+    const auto streamType = pb.NewStreamType(pb.NewMultiType({key32Type, key64Type, numberType, stringType}));
+    const auto streamCallable = TCallableBuilder(pb.GetTypeEnvironment(), "ExternalNode", streamType).Build();
+
+    TRuntimeNode input(streamCallable, false);
+    if (useFlow) {
+        input = pb.ToFlow(input, {});
+    }
+    auto opNode = GetOperatorNode(
+        pb,
+        isAggregator,
+        Spilling,
+        128ull << 20,
+        input,
+        [&](TRuntimeNode::TList items) -> TRuntimeNode::TList {
+            if (computedKeys) {
+                return {pb.AggrAdd(items[0], pb.template NewDataLiteral<ui32>(0)), items[1]};
+            }
+            return {items[0], items[1]};
+        },
+        [](TRuntimeNode::TList, TRuntimeNode::TList items) -> TRuntimeNode::TList {
+            return {items[2], items[3]};
+        },
+        [&](TRuntimeNode::TList, TRuntimeNode::TList items, TRuntimeNode::TList state) -> TRuntimeNode::TList {
+            return {pb.AggrAdd(state[0], items[2]), pb.AggrMax(state[1], items[3])};
+        },
+        [](TRuntimeNode::TList keys, TRuntimeNode::TList state) -> TRuntimeNode::TList {
+            return {keys[0], keys[1], state[0], state[1]};
+        });
+
+    if (useFlow) {
+        opNode = pb.FromFlow(opNode);
+    }
+    return setup.BuildGraph(opNode, {streamCallable});
+}
+
+template<bool LLVM, bool Spilling = false>
+void RunMixedWideTest(TDqSetup<LLVM, Spilling>& setup, bool useFlow, bool isAggregator, bool computedKeys) {
+    setup.Alloc.Ref().ForcefullySetMemoryYellowZone(false);
+    auto graph = BuildMixedWideGraph(setup, useFlow, isAggregator, computedKeys);
+    if constexpr (Spilling) {
+        graph->GetContext().SpillerFactory = CreateSpillerFactory();
+    }
+
+    TMixedReference reference;
+    std::function<void(size_t)> callback;
+    if constexpr (Spilling) {
+        callback = [&setup](size_t row) {
+            if (row == 100) {
+                setup.Alloc.Ref().ForcefullySetMemoryYellowZone(true);
+            }
+        };
+    }
+    const size_t rowCount = Spilling ? 1000 : 300;
+    graph->GetEntryPoint(0, true)->SetValue(
+        graph->GetContext(), NUdf::TUnboxedValuePod(new TMixedWideStream(rowCount, reference, callback)));
+
+    auto resultStream = graph->GetValue();
+    std::vector<NUdf::TUnboxedValue> output(4);
+    TMixedReference actual;
+    for (;;) {
+        const auto status = resultStream.WideFetch(output.data(), output.size());
+        if (status == NUdf::EFetchStatus::Finish) {
+            break;
+        }
+        if (status == NUdf::EFetchStatus::Yield) {
+            continue;
+        }
+        std::optional<i64> key64;
+        if (output[1]) {
+            key64 = output[1].Get<i64>();
+        }
+        const TMixedKey key{output[0].Get<ui32>(), key64};
+        const TMixedState state{
+            output[2].Get<ui64>(),
+            std::string(output[3].AsStringRef().Data(), output[3].AsStringRef().Size())
+        };
+        UNIT_ASSERT(actual.emplace(key, state).second);
+    }
+    UNIT_ASSERT(actual == reference);
+}
+
 template<bool LLVM, bool Spilling = false>
 THolder<IComputationGraph> BuildZeroWidthWideGraph(TDqSetup<LLVM, Spilling>& setup, const bool useFlow, const bool isAggregator, const size_t memLimit, std::vector<TType*>& columnTypes) {
     auto& pb = setup.GetDqProgramBuilder();
@@ -733,7 +873,7 @@ TOperatorEndState RunDqCombineWideTest(const bool useFlow, StreamCreator streamC
 
 template<bool UseLLVM, bool Spilling, typename StreamCreator, typename StreamChecker>
 void RunDqAggregateEarlyStopTest(TDqSetup<UseLLVM, Spilling>& setup, const bool useFlow,
-    StreamCreator streamCreator, StreamChecker streamChecker, const bool disableDehydration,
+    StreamCreator streamCreator, StreamChecker streamChecker,
     std::shared_ptr<ISpillerFactory> spillerFactory = {})
 {
     const ui32 keyWidth = 2;
@@ -746,10 +886,6 @@ void RunDqAggregateEarlyStopTest(TDqSetup<UseLLVM, Spilling>& setup, const bool 
 
     if (Spilling) {
         graph->GetContext().SpillerFactory = spillerFactory ? spillerFactory : CreateSpillerFactory();
-    }
-
-    if (disableDehydration) {
-        DisableDehydration(graph);
     }
 
     std::unordered_map<std::string, std::vector<ui64>> refResult;
@@ -803,7 +939,7 @@ void RunDqAggregateBlockTest(TDqSetup<UseLLVM, Spilling>& setup, const bool useF
 }
 
 template<bool LLVM, bool Spilling, typename StreamCreator>
-void RunDqAggregateWideTest(TDqSetup<LLVM, Spilling>& setup, const bool useFlow, StreamCreator streamCreator, const ui32 keyWidth = 2, const bool disableDehydration = false, const bool disableKeyPassthrough = false)
+void RunDqAggregateWideTest(TDqSetup<LLVM, Spilling>& setup, const bool useFlow, StreamCreator streamCreator, const ui32 keyWidth = 2, const bool disableKeyPassthrough = false)
 {
     setup.Alloc.Ref().ForcefullySetMemoryYellowZone(false);
 
@@ -817,9 +953,6 @@ void RunDqAggregateWideTest(TDqSetup<LLVM, Spilling>& setup, const bool useFlow,
         graph->GetContext().SpillerFactory = CreateSpillerFactory();
     }
 
-    if (disableDehydration) {
-        DisableDehydration(graph);
-    }
     if (disableKeyPassthrough) {
         DisableKeyPassthrough(graph);
     }
@@ -868,6 +1001,25 @@ void RunDqAggregateZeroWidthTest(TDqSetup<UseLLVM, Spilling>& setup, const bool 
 } // anonymous namespace
 
 Y_UNIT_TEST_SUITE(TDqHashCombineTest) {
+    Y_UNIT_TEST_QUAD(TestMixedNativeAndStringValues, UseLLVM, UseFlow) {
+        {
+            TDqSetup<UseLLVM, false> setup(GetDqNodeFactory());
+            RunMixedWideTest(setup, UseFlow, true, false);
+        }
+        {
+            TDqSetup<UseLLVM, false> setup(GetDqNodeFactory());
+            RunMixedWideTest(setup, UseFlow, true, true);
+        }
+        {
+            TDqSetup<UseLLVM, false> setup(GetDqNodeFactory());
+            RunMixedWideTest(setup, UseFlow, false, true);
+        }
+    }
+
+    Y_UNIT_TEST_QUAD(TestMixedNativeAndStringValuesWithSpilling, UseLLVM, UseFlow) {
+        TDqSetup<UseLLVM, true> setup(GetDqNodeFactory());
+        RunMixedWideTest(setup, UseFlow, true, false);
+    }
 
     Y_UNIT_TEST_QUAD(TestWideModeNoInput, UseLLVM, UseFlow) {
         RunDqCombineWideTest<UseLLVM>(UseFlow, [](TComputationContext& ctx, std::vector<TType*>& columnTypes, ui32 keyWidth, auto& refMap) {
@@ -988,17 +1140,6 @@ Y_UNIT_TEST_SUITE(TDqHashCombineTest) {
         });
     }
 
-    Y_UNIT_TEST_QUAD(TestWideModeAggregationWithSpillingNonDehydrated, UseLLVM, UseFlow) {
-        TDqSetup<UseLLVM, true> setup(GetDqNodeFactory());
-        RunDqAggregateWideTest(setup, UseFlow, [&](TComputationContext& ctx, std::vector<TType*>& columnTypes, ui32 keyWidth, auto& refMap) {
-            return new TWideKVStream(ctx, 100000, 10, columnTypes, keyWidth, refMap, [&](const size_t rowNum, [[maybe_unused]] bool& yield) {
-                if (rowNum == 100000) {
-                    setup.Alloc.Ref().ForcefullySetMemoryYellowZone(true);
-                }
-            });
-        }, 2, true, false);
-    }
-
     Y_UNIT_TEST_QUAD(TestWideModeAggregationWithSpillingNonPassthrough, UseLLVM, UseFlow) {
         TDqSetup<UseLLVM, true> setup(GetDqNodeFactory());
         RunDqAggregateWideTest(setup, UseFlow, [&](TComputationContext& ctx, std::vector<TType*>& columnTypes, ui32 keyWidth, auto& refMap) {
@@ -1007,7 +1148,7 @@ Y_UNIT_TEST_SUITE(TDqHashCombineTest) {
                     setup.Alloc.Ref().ForcefullySetMemoryYellowZone(true);
                 }
             });
-        }, 2, false, true);
+        }, 2, true);
     }
 
     Y_UNIT_TEST_QUAD(TestWideModeAggregationMultiRowNoSpilling, UseLLVM, UseFlow) {
@@ -1063,18 +1204,7 @@ Y_UNIT_TEST_SUITE(TDqHashCombineTest) {
             setup,
             UseFlow,
             streamCreator,
-            streamChecker,
-            false
-        );
-
-        lineCount = 0;
-
-        RunDqAggregateEarlyStopTest(
-            setup,
-            UseFlow,
-            streamCreator,
-            streamChecker,
-            true
+            streamChecker
         );
     }
 
@@ -1102,18 +1232,7 @@ Y_UNIT_TEST_SUITE(TDqHashCombineTest) {
             setup,
             UseFlow,
             streamCreator,
-            streamChecker,
-            false
-        );
-
-        stopping = false;
-
-        RunDqAggregateEarlyStopTest(
-            setup,
-            UseFlow,
-            streamCreator,
-            streamChecker,
-            true
+            streamChecker
         );
     }
 
@@ -1141,7 +1260,6 @@ Y_UNIT_TEST_SUITE(TDqHashCombineTest) {
             UseFlow,
             streamCreator,
             streamChecker,
-            false,
             std::make_shared<TPendingSpillerFactory>()
         );
     }
@@ -1169,18 +1287,7 @@ Y_UNIT_TEST_SUITE(TDqHashCombineTest) {
             setup,
             UseFlow,
             streamCreator,
-            streamChecker,
-            false
-        );
-
-        lineCount = 0;
-
-        RunDqAggregateEarlyStopTest(
-            setup,
-            UseFlow,
-            streamCreator,
-            streamChecker,
-            true
+            streamChecker
         );
     }
 } // Y_UNIT_TEST_SUITE
