@@ -1,0 +1,85 @@
+((let $6 (DqPhyStage 
+    '() 
+    (lambda '() (DqPhyHashCombine 
+        (WideMap 
+            (FromFlow (KqpBlockReadOlapTableRanges 
+                (KqpTable '"/Root/testdb/clickbench/hits" '"72075186224037897:33" '"" '1) 
+                (Void) 
+                '('"URL" '"UserID") 
+                '() 
+                '() 
+                (lambda '($23) $23)
+            )) 
+            (lambda '($24 $25 $26) (BlockAsStruct 
+                '('"URL" $24) 
+                '('"UserID" $25)
+            ) $26)
+        ) 
+        '-1073741824 
+        (lambda '($27) (Member $27 '"URL") (Member $27 '"UserID")) 
+        (lambda '($28 $29 $30) (Uint64 '1)) 
+        (lambda '($31 $32 $33 $34) (AggrAdd $34 (Uint64 '1))) 
+        (lambda '($35 $36 $37) $35 $36 $37)
+    )) 
+    '('('"_logical_id" '1581) '('"_id" '"70ceb482-f3a1ab5b-f41cbaab-37df47eb") '('"_wide_channels" (StructType 
+        '('"URL" (DataType 'Utf8)) 
+        '('"UserID" (DataType 'Int64)) 
+        '('_yql_agg_0 (DataType 'Uint64))
+    )))
+))
+(let $11 (DqPhyStage 
+    '((DqCnHashShuffle 
+        (TDqOutput $6 '0) 
+        '('0 '1)
+    )) 
+    (lambda '($38) (WideTopSortBlocks (DqPhyHashCombine 
+        $38 
+        '"" 
+        (lambda '($42 $43 $44) $42 $43) 
+        (lambda '($45 $46 $47 $48 $49) $49) 
+        (lambda '($50 $51 $52 $53 $54 $55) (AggrAdd $54 $55)) 
+        (lambda '($56 $57 $58) $58 $56 $57)
+    ) (Uint64 '10) '('('0 (Bool 'false))))) 
+    '('('"_logical_id" '2125) '('"_id" '"f5bbe4af-a4a1697-aef32f1b-38613b4e") '('"_wide_channels" (StructType 
+        '('Count0 (DataType 'Uint64)) 
+        '('"URL" (DataType 'Utf8)) 
+        '('"UserID" (DataType 'Int64))
+    )))
+))
+(let $13 (DqPhyStage 
+    '((DqCnMerge 
+        (TDqOutput $11 '0) 
+        '('('0 '"Desc"))
+    )) 
+    (lambda '($59) (FromFlow (NarrowMap 
+        (ToFlow (WideFromBlocks (WideMap 
+            (WideTakeBlocks ⦗Input⦘$59 ⦗Count⦘(Uint64 '10)) 
+            (lambda '($61 $62 $63 $64) (BlockAsStruct 
+                '('"URL" $62) 
+                '('"UserID" $63) 
+                '('"c" $61)
+            ) $64)
+        ))) 
+        (lambda '($66) $66)
+    ))) 
+    '('('"_logical_id" '2226) '('"_id" '"bd2091a9-2321a74d-a1960943-808eec1d"))
+))
+(return (KqpPhysicalQuery 
+    '((KqpPhysicalTx 
+        '($6 $11 $13) 
+        '((DqCnResult (TDqOutput $13 '0) '('"UserID" '"URL" '"c"))) 
+        '() 
+        '('('"type" '"generic"))
+    )) 
+    '((KqpTxResultBinding 
+        (ListType (StructType 
+            '('"URL" (DataType 'Utf8)) 
+            '('"UserID" (DataType 'Int64)) 
+            '('"c" (DataType 'Uint64))
+        )) 
+        '0 
+        '0
+    )) 
+    '('('"type" '"query"))
+))
+)
