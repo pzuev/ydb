@@ -1752,6 +1752,40 @@ void RunDqAggregateZeroWidthTest(TDqSetup<UseLLVM, Spilling>& setup, const bool 
 } // anonymous namespace
 
 Y_UNIT_TEST_SUITE(TDqHashCombineTest) {
+    Y_UNIT_TEST_QUAD(TestAggregationSubmaps, UseLLVM, UseFlow) {
+        for (const size_t groups : {1ULL, 300000ULL}) {
+            TDqSetup<UseLLVM> setup(GetHashCombineNodeFactory());
+            std::vector<TType*> columnTypes;
+            auto graph = BuildWideGraph(setup, UseFlow, true, 0, columnTypes, 1);
+            TDqHashCombineTestState finalState;
+            SetTestStateCallback(graph, [&](const TDqHashCombineTestState& state) { finalState = state; });
+            graph->GetEntryPoint(0, true)->SetValue(graph->GetContext(), NUdf::TUnboxedValuePod(
+                new TGeneratedWideStream(groups * 3, [groups](size_t row) {
+                    const TString key = ToString(row % groups);
+                    return std::vector<NUdf::TUnboxedValue>{
+                        NUdf::TUnboxedValuePod::Embedded(key), NUdf::TUnboxedValuePod(ui64(row / groups + 1))};
+                })));
+            auto stream = graph->GetValue();
+            std::unordered_map<std::string, std::vector<ui64>> result;
+            UNIT_ASSERT_VALUES_EQUAL(CollectStreamOutputs(stream, 2, 1, result, false, true), groups);
+            for (size_t group = 0; group < groups; ++group) {
+                UNIT_ASSERT_VALUES_EQUAL(result.at(std::to_string(group) + "//").at(0), 6);
+            }
+            size_t totalSize = 0;
+            size_t allocatedMaps = 0;
+            for (const auto& map : finalState.Maps) {
+                totalSize += map.Size;
+                allocatedMaps += map.Capacity != 0;
+                UNIT_ASSERT(map.Size * 2 < map.Capacity || !map.Capacity);
+                if (groups > 1 && finalState.Maps.size() > 1) {
+                    UNIT_ASSERT(map.Size < groups);
+                }
+            }
+            UNIT_ASSERT_VALUES_EQUAL(totalSize, groups);
+            UNIT_ASSERT_VALUES_EQUAL(allocatedMaps, groups == 1 ? 1 : finalState.Maps.size());
+        }
+    }
+
     Y_UNIT_TEST_QUAD(TestSampledRowLimit, UseLLVM, UseFlow) {
         for (const bool structure : {false, true}) {
             TDqSetup<UseLLVM> setup(GetDqNodeFactory());

@@ -772,6 +772,9 @@ constexpr const size_t LowerFixedRowCount = 1024ULL; // minimum viable hash tabl
 constexpr const size_t UpperFixedRowCount = 128 * 1024ULL; // maximum hash table size, rows (fixed constant for now)
 constexpr const size_t BucketBits = 7;
 constexpr const size_t NumBuckets = 1ULL << BucketBits;
+constexpr size_t NumMaps = NumBuckets;
+static_assert(NumMaps > 0 && NumBuckets % NumMaps == 0);
+constexpr size_t InitialAggregationMapRowCount = 128ULL * 1024 / NumMaps;
 constexpr const size_t SpillingIoBuffer = 5_MB;
 constexpr const size_t StorageArenaMinSize = 32_MB;
 
@@ -789,6 +792,12 @@ class TBaseAggregationState: public TComputationValue<TBaseAggregationState>
 {
 protected:
     using TMap = TDqRobinHoodHashSet<char*, TEqualsFunc, TMKQLAllocator<char, EMemorySubPool::Temporary>>;
+
+    struct TSubMap {
+        THolder<TMap> Map;
+        size_t MaxRowCount = 0;
+        bool AutoGrowLimitReached = false;
+    };
 
     static size_t GetStaticMaxRowCount(size_t entryPayloadSizeBytes, size_t memoryLimit) {
         size_t memoryPerRow = entryPayloadSizeBytes + static_cast<size_t>(TMap::GetCellSize() * ExtraMapCapacity);
@@ -932,7 +941,7 @@ protected:
             UDF_LOG(Logger, LogComponent, NUdf::ELogLevel::Debug, TStringBuilder() << "Spilled state bucket " << i << ": " << bucketEntries << " entries");
         }
 
-        Map->Clear();
+        ClearMaps();
         StoreContainsPackedRecords = false;
         Store->Format(NumBuckets, sizeof(TUnboxedValuePod) * InputUnpackedWidth);
     }
@@ -1011,14 +1020,14 @@ protected:
         // Run aggregation on a single bucket
 
         // TODO: maybe reallocate?
-        if (Map->GetSize() > 0) {
-            Map->Clear();
-        }
+        ClearMaps();
 
         TTaskSpillage& currentSpill = SpillingStack.back();
 
         const ui32 bucket = currentSpill.CurrentBucket;
         MKQL_ENSURE(bucket < NumBuckets, "Trying to read past the last spilling bucket");
+        auto& subMap = GetOrCreateMap(bucket);
+        auto& map = subMap.Map;
 
         StoreContainsPackedRecords = true;
         Store->Format(1, RecordLayout.GetRecordSize());
@@ -1060,9 +1069,10 @@ protected:
                     TArrayRef<TUnboxedValue>(logicalTuple.data() + keysCount, keyAndStatesCount - keysCount),
                     record + StatesOffset);
                 bool isNew = false;
-                Map->Insert(record, GlobalHashToRhItemHash(hash), isNew);
+                map->Insert(record, GlobalHashToRhItemHash(hash), isNew);
 
                 MKQL_ENSURE(isNew, "Every key in the spilled state must be unique");
+                ++TotalRowCount;
             }
         }
 
@@ -1106,7 +1116,7 @@ protected:
                 bool isNew = false;
                 const auto& keyLayout = RecordLayout.GetKeyLayout();
                 const ui32 rhHash = GlobalHashToRhItemHash(Hasher(TempKeyBuffer.data()));
-                char* mapIt = Map->InsertWithEqual(reinterpret_cast<char*>(TempKeyBuffer.data()), rhHash,
+                char* mapIt = map->InsertWithEqual(reinterpret_cast<char*>(TempKeyBuffer.data()), rhHash,
                     isNew, [&](char* stored, [[maybe_unused]] char* probe) {
 #ifndef NDEBUG
                         MKQL_ENSURE(probe == reinterpret_cast<char*>(TempKeyBuffer.data()), "Unexpected aggregation probe key");
@@ -1116,12 +1126,13 @@ protected:
                 char* statePtr = nullptr;
 
                 if (isNew) {
+                    ++TotalRowCount;
                     record = static_cast<char*>(Store->Alloc(0));
                     RecordLayout.GetStateLayout().Clear(record + StatesOffset);
                     keyLayout.PackWithRefs(TempKeyBuffer, record);
-                    *static_cast<char**>(Map->GetKeyPtr(mapIt)) = record;
+                    *static_cast<char**>(map->GetKeyPtr(mapIt)) = record;
                 } else {
-                    record = Map->GetKeyValue(mapIt);
+                    record = map->GetKeyValue(mapIt);
                 }
                 statePtr = record + StatesOffset;
 
@@ -1132,8 +1143,8 @@ protected:
                 }
 
                 if (isNew) {
-                    CheckAutoGrowMap(true);
-                    if (Map->GetSize() > MaxRowCount) {
+                    CheckAutoGrowMap(subMap, true);
+                    if (map->GetSize() > subMap.MaxRowCount) {
                         throw TMemoryLimitExceededException();
                     }
                 }
@@ -1151,23 +1162,60 @@ protected:
         return CurrentAsyncTask.CheckPending();
     }
 
-    void CheckAutoGrowMap(const bool hasMemoryForProcessing)
+    void CheckAutoGrowMap(TSubMap& subMap, const bool hasMemoryForProcessing)
     {
-        if (MapAutoGrowEnabled && !MapAutoGrowLimitReached && Map->GetSize() >= MaxRowCount) {
+        auto& map = subMap.Map;
+        if (IsAggregation && !subMap.AutoGrowLimitReached && map->GetSize() >= subMap.MaxRowCount) {
             if (hasMemoryForProcessing) {
                 try {
-                    Map->CheckGrow();
-                    MaxRowCount = Map->GetCapacity() / 2;
+                    map->CheckGrow();
+                    subMap.MaxRowCount = map->GetCapacity() / 2;
                     return;
                 }
                 catch(const TMemoryLimitExceededException& e) {
                 }
             }
 
-            MapAutoGrowLimitReached = true;
+            subMap.AutoGrowLimitReached = true;
             // Slow, but still better than spilling or crashing
-            MaxRowCount = Map->GetCapacity() / 1.3;
+            subMap.MaxRowCount = map->GetCapacity() / 1.3;
         }
+    }
+
+    size_t GetBucketId(ui64 hash) const {
+        // Lower 16 bits of the same hash value are used by the hash shuffle connection to distribute keys among tasks,
+        // so we can't use these (even with the hash seed).
+        // Another solution would be to rehash using a different function but shifted bits are uniform enough.
+        // Actual hashmap items are using the upper 32 bits.
+        return IsAggregation ? (hash >> 16) & (NumBuckets - 1) : 0;
+    }
+
+    static size_t GetMapId(size_t bucketId) {
+        return bucketId / (NumBuckets / NumMaps);
+    }
+
+    TSubMap& GetOrCreateMap(size_t bucketId) {
+        auto& subMap = Maps[GetMapId(bucketId)];
+        if (!subMap.Map) {
+            subMap.MaxRowCount = TryAllocMapForRowCount(subMap, InitialAggregationMapRowCount);
+        }
+        return subMap;
+    }
+
+    void ClearMaps() {
+        for (auto& subMap : Maps) {
+            if (subMap.Map && !subMap.Map->Empty()) {
+                subMap.Map->Clear();
+            }
+        }
+        TotalRowCount = 0;
+    }
+
+    void ResetMaps() {
+        for (auto& subMap : Maps) {
+            subMap.Map.Reset();
+        }
+        TotalRowCount = 0;
     }
 
     Y_FORCE_INLINE void LoadItemAndKey(TUnboxedValue* const* input, TUnboxedValuePod* const keyBuffer) {
@@ -1230,17 +1278,11 @@ protected:
     }
 
     EFillState ProcessFetchedRow(TUnboxedValue* const* input, TArrayRef<TUnboxedValuePod> keyBuf, ui64 hash) {
-        ui64 bucketId = 0;
-        if (EnableSpilling) {
-            // Lower 16 bits of the same hash value are used by the hash shuffle connection to distribute keys among tasks,
-            // so we can't use these (even with the hash seed).
-            // Another solution would be to rehash using a different function but shifted bits are uniform enough.
-            // Actual hashmap items are using the upper 32 bits.
-            bucketId = (hash >> 16) & ((1ull << BucketBits) - 1ull);
-        }
+        const size_t bucketId = GetBucketId(hash);
+        const size_t storeBucketId = EnableSpilling ? bucketId : 0;
 
         if (!SpillingStack.empty()) {
-            auto rowBuffer = static_cast<TUnboxedValuePod*>(Store->Alloc(bucketId));
+            auto rowBuffer = static_cast<TUnboxedValuePod*>(Store->Alloc(storeBucketId));
             for (size_t i = 0; i < InputUnpackedWidth; ++i) {
                 rowBuffer[i] = *input[i];
                 rowBuffer[i].Ref();
@@ -1272,11 +1314,13 @@ protected:
             return EFillState::ContinueFilling;
         }
 
+        auto& subMap = GetOrCreateMap(bucketId);
+        auto& map = subMap.Map;
         const auto& keyLayout = RecordLayout.GetKeyLayout();
         char* record = nullptr;
         bool isNew = false;
         const ui32 rhHash = GlobalHashToRhItemHash(hash);
-        auto mapIt = Map->InsertWithEqual(reinterpret_cast<char*>(keyBuf.data()), rhHash,
+        auto mapIt = map->InsertWithEqual(reinterpret_cast<char*>(keyBuf.data()), rhHash,
             isNew, [&](char* stored, [[maybe_unused]] char* probe) {
 #ifndef NDEBUG
                 MKQL_ENSURE(probe == reinterpret_cast<char*>(keyBuf.data()), "Unexpected aggregation probe key");
@@ -1285,12 +1329,13 @@ protected:
             });
         char* statePtr = nullptr;
         if (isNew) {
-            record = static_cast<char*>(Store->Alloc(bucketId));
+            ++TotalRowCount;
+            record = static_cast<char*>(Store->Alloc(storeBucketId));
             RecordLayout.GetStateLayout().Clear(record + StatesOffset);
             keyLayout.PackWithRefs(keyBuf, record);
-            *static_cast<char**>(Map->GetKeyPtr(mapIt)) = record;
+            *static_cast<char**>(map->GetKeyPtr(mapIt)) = record;
         } else {
-            record = Map->GetKeyValue(mapIt);
+            record = map->GetKeyValue(mapIt);
         }
         statePtr = record + StatesOffset;
 
@@ -1303,8 +1348,8 @@ protected:
         auto canFitMoreKeys = [&]() -> bool {
             if (isNew) {
                 const bool hasMemoryForProcessing = HasMemoryForProcessing();
-                CheckAutoGrowMap(hasMemoryForProcessing);
-                if (Map->GetSize() >= MaxRowCount) {
+                CheckAutoGrowMap(subMap, hasMemoryForProcessing);
+                if (map->GetSize() >= subMap.MaxRowCount) {
                     return false;
                 }
                 if (IsAggregation && !EnableSpilling) {
@@ -1312,7 +1357,7 @@ protected:
                     // So we don't check for yellow zone in this case.
                     return true;
                 }
-                if (!hasMemoryForProcessing && Map->GetSize() >= LowerFixedRowCount) {
+                if (!hasMemoryForProcessing && TotalRowCount >= LowerFixedRowCount) {
                     return false;
                 }
             }
@@ -1377,7 +1422,11 @@ protected:
     EFillState ProcessPrefetchBatch() {
         if (!PrefetchPos) {
             for (size_t slot = 0; slot < PrefetchCount; ++slot) {
-                Map->Prefetch(GlobalHashToRhItemHash(PrefetchHashes[slot]));
+                const ui64 hash = PrefetchHashes[slot];
+                const auto& subMap = Maps[GetMapId(GetBucketId(hash))];
+                if (subMap.Map) {
+                    subMap.Map->Prefetch(GlobalHashToRhItemHash(hash));
+                }
             }
         }
 
@@ -1466,19 +1515,16 @@ public:
         TempKeyBuffer.resize(KeyTypes.size(), {});
 
         if (!IsAggregation) {
+            auto& subMap = Maps[0];
             const auto staticMemorySize = RecordLayout.GetStaticMemorySize();
             IsEstimating = !staticMemorySize;
             if (IsEstimating) {
-                MaxRowCount = CombineMemorySampleRowCount;
+                subMap.MaxRowCount = CombineMemorySampleRowCount;
             } else {
-                MaxRowCount = GetStaticMaxRowCount(*staticMemorySize, MemoryLimit);
+                subMap.MaxRowCount = GetStaticMaxRowCount(*staticMemorySize, MemoryLimit);
             }
-        } else {
-            MaxRowCount = 64ULL * 1024;
-            MapAutoGrowEnabled = true;
+            subMap.MaxRowCount = TryAllocMapForRowCount(subMap, subMap.MaxRowCount);
         }
-
-        MaxRowCount = TryAllocMapForRowCount(MaxRowCount);
 
         if (IsAggregation && !TestParams.DisableKeyPassthrough) {
             std::vector<ui32> keySourceItems;
@@ -1573,7 +1619,15 @@ protected:
         if (!TestParams.StateCallback) {
             return;
         }
+        std::vector<TDqHashCombineTestState::TMapState> maps;
+        for (const auto& subMap : Maps) {
+            maps.push_back({
+                .Size = subMap.Map ? subMap.Map->GetSize() : 0,
+                .Capacity = subMap.Map ? subMap.Map->GetCapacity() : 0,
+            });
+        }
         TestParams.StateCallback({
+            .Maps = std::move(maps),
             .BypassActivated = BypassActivated,
             .FastFinalizeEnabled = bool(FastFinalizer),
             .SpillingBucketsRead = SpillingStack.empty() ? 0 : SpillingStack.back().CurrentBucket,
@@ -1594,26 +1648,28 @@ protected:
         }
     }
 
-    size_t TryAllocMapForRowCount(size_t rowCount)
+    size_t TryAllocMapForRowCount(TSubMap& subMap, size_t rowCount)
     {
+        auto& map = subMap.Map;
+        const size_t lowerRowCount = IsAggregation ? LowerFixedRowCount / NumMaps : LowerFixedRowCount;
         // Avoid reallocating the map
         // TODO: although Clear()-ing might be actually more expensive than reallocation
-        if (Map) {
-            const size_t oldCapacity = Map->GetCapacity();
+        if (map) {
+            const size_t oldCapacity = map->GetCapacity();
             size_t newCapacity = GetMapCapacity(rowCount);
             if (newCapacity <= oldCapacity) {
-                Map->Clear();
+                map->Clear();
                 return rowCount;
             }
-            Map.Reset(nullptr);
+            map.Reset(nullptr);
         }
 
-        auto tryAlloc = [this](size_t rows) -> bool {
+        auto tryAlloc = [this, &map](size_t rows) -> bool {
             size_t newCapacity = GetMapCapacity(rows);
             try {
-                Map.Reset(new TMap(Equals, newCapacity));
+                map.Reset(new TMap(Equals, newCapacity));
                 if (!HasMemoryForProcessing()) {
-                    Map.Reset(nullptr);
+                    map.Reset(nullptr);
                     return false;
                 }
                 return true;
@@ -1623,7 +1679,7 @@ protected:
             return false;
         };
 
-        while (rowCount > LowerFixedRowCount) {
+        while (rowCount > lowerRowCount) {
             if (tryAlloc(rowCount)) {
                 return rowCount;
             }
@@ -1631,13 +1687,15 @@ protected:
         }
 
         // This can emit uncaught TMemoryLimitExceededException if we can't afford even a tiny map
-        size_t smallCapacity = GetMapCapacity(LowerFixedRowCount);
-        Map.Reset(new TMap(Equals, smallCapacity));
-        return LowerFixedRowCount;
+        size_t smallCapacity = GetMapCapacity(lowerRowCount);
+        map.Reset(new TMap(Equals, smallCapacity));
+        return lowerRowCount;
     }
 
     void UpdateRowLimitFromSample()
     {
+        auto& subMap = Maps[0];
+        const auto& map = subMap.Map;
         if (Incompressible) {
             return;
         }
@@ -1645,18 +1703,18 @@ protected:
         // If we have achieved a "good" compression ratio (defined by a constant) then we probably don't need to resize the map further
         // The compression ratio is the amount of input keys vs. the amount of unique input keys;
         // we only check this at most once, after counting input rows from the state initialization up to the moment the hash map starts to drain.
-        if (!Map->GetSize() || (static_cast<double>(InputRows) / Map->GetSize() >= MaxCompressionRatio)) {
+        if (!map->GetSize() || (static_cast<double>(InputRows) / map->GetSize() >= MaxCompressionRatio)) {
             return;
         }
 
         size_t totalMem = 0;
         bool unbounded = false;
 
-        for (auto mapIter = Map->Begin(); mapIter != Map->End() && !unbounded; Map->Advance(mapIter)) {
-            if (!Map->IsValid(mapIter)) {
+        for (auto mapIter = map->Begin(); mapIter != map->End() && !unbounded; map->Advance(mapIter)) {
+            if (!map->IsValid(mapIter)) {
                 continue;
             }
-            auto* entry = Map->GetKeyValue(mapIter);
+            auto* entry = map->GetKeyValue(mapIter);
             auto entryMem = RecordLayout.EstimateMemorySize(entry);
             if (!entryMem.has_value()) {
                 unbounded = true;
@@ -1666,8 +1724,8 @@ protected:
         }
 
         if (!unbounded && totalMem > 0) {
-            const size_t averageMem = totalMem / Map->GetSize() + (totalMem % Map->GetSize() != 0);
-            MaxRowCount = GetStaticMaxRowCount(averageMem, MemoryLimit);
+            const size_t averageMem = totalMem / map->GetSize() + (totalMem % map->GetSize() != 0);
+            subMap.MaxRowCount = GetStaticMaxRowCount(averageMem, MemoryLimit);
         }
         // If we can't guess the memory usage, we'll keep the same small table; it's 0.25MB for 16K 16-byte cells currently, no need to shrink it further
     }
@@ -1678,19 +1736,17 @@ protected:
             IsEstimating = false;
             BypassActivated = true;
             CallTestStateCallback();
-            Map.Reset();
+            ResetMaps();
             Store->Clear();
             return;
         }
 
-        if (Map->GetSize() != 0) {
-            if (IsEstimating && !SourceEmpty) {
-                IsEstimating = false;
-                MaxRowCount = TryAllocMapForRowCount(MaxRowCount);
-            } else {
-                Map->Clear();
-            }
+        auto& subMap = Maps[0];
+        if (IsEstimating && !SourceEmpty && subMap.Map && !subMap.Map->Empty()) {
+            IsEstimating = false;
+            subMap.MaxRowCount = TryAllocMapForRowCount(subMap, subMap.MaxRowCount);
         }
+        ClearMaps();
         Store->Clear();
         StoreContainsPackedRecords = true;
         Store->Format(EnableSpilling ? NumBuckets : 1, RecordLayout.GetRecordSize());
@@ -1702,10 +1758,10 @@ protected:
         // So we must yield if OpenDrain() returns true
         if (CanBypass && !CompressibilityChecked) {
             CompressibilityChecked = true;
-            Incompressible = !SourceEmpty && Map->GetSize() &&
-                InputRows * IncompressibleThresholdRatio <= Map->GetSize();
+            Incompressible = !SourceEmpty && TotalRowCount &&
+                InputRows * IncompressibleThresholdRatio <= TotalRowCount;
         }
-        if (!SourceEmpty && IsEstimating && Map->GetSize() > 0) {
+        if (!SourceEmpty && IsEstimating && TotalRowCount > 0) {
             UpdateRowLimitFromSample();
         }
         Draining = true;
@@ -1714,6 +1770,7 @@ protected:
         } else {
             DrainArenaIterator = {};
         }
+        CallTestStateCallback();
         return FlushSpillingInput();
     }
 
@@ -1757,9 +1814,7 @@ protected:
             }
         }
 
-        if (Map) {
-            Map = nullptr;
-        }
+        ResetMaps();
         Store->Clear();
     }
 
@@ -1780,10 +1835,8 @@ protected:
     bool IsEstimating = false;
 
     size_t EstimateBatchSize = 0;
-    size_t MaxRowCount = 0;
     size_t InitialMapCapacity = 0;
-    bool MapAutoGrowEnabled = false;
-    bool MapAutoGrowLimitReached = false;
+    size_t TotalRowCount = 0;
 
     size_t InputUnpackedWidth;
     const NDqHashOperatorCommon::TCombinerNodes& Nodes;
@@ -1801,7 +1854,7 @@ protected:
     std::unique_ptr<TStore> Store;
     bool StoreContainsPackedRecords = true;
     TSegmentedArena::TIterator DrainArenaIterator;
-    THolder<TMap> Map;
+    std::array<TSubMap, NumMaps> Maps;
     std::vector<TUnboxedValuePod> TempKeyBuffer;
     TUnboxedValueVector InputBuffer;
     size_t StatesOffset;
@@ -1944,7 +1997,7 @@ public:
             if (!IsAggregation) {
                 PrepareForNewBatch();
             } else {
-                Map.Reset();
+                ResetMaps();
                 Store->Clear();
             }
             Draining = false;
@@ -2316,7 +2369,7 @@ public:
         if (!IsAggregation) {
             PrepareForNewBatch();
         } else {
-            Map.Reset();
+            ResetMaps();
             Store->Clear();
         }
 

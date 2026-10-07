@@ -12,6 +12,11 @@ class TCallable;
 struct TComputationNodeFactoryContext;
 
 struct TDqHashCombineTestState {
+    struct TMapState {
+        size_t Size = 0;
+        size_t Capacity = 0;
+    };
+    std::vector<TMapState> Maps;
     bool BypassActivated = false;
     bool FastFinalizeEnabled = false;
     size_t SpillingBucketsRead = 0;
